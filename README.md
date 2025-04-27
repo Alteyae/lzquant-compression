@@ -107,3 +107,4 @@ For optimal performance:
 - **Memory Issues**: Reduce worker count or batch size
 
 For more detailed diagnostics, check the `/health/detailed` endpoint.# plz-compression-site
+# lzquant-compression
