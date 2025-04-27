@@ -108,3 +108,4 @@ For optimal performance:
 
 For more detailed diagnostics, check the `/health/detailed` endpoint.# plz-compression-site
 # lzquant-compression
+# lzquant-compression
