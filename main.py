@@ -33,7 +33,7 @@ try:
     import zstandard
     import psutil
     import numpy
-    import sklearn
+    import skimage
     logger.info("All required dependencies are available")
 except ImportError as e:
     logger.critical(f"Missing required dependency: {str(e)}")

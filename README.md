@@ -107,6 +107,5 @@ For optimal performance:
 - **Memory Issues**: Reduce worker count or batch size
 
 For more detailed diagnostics, check the `/health/detailed` endpoint.# plz-compression-site
-# lzquant-compression
-# lzquant-compression
-# lzquant-compression
+
+For more information about the lzquant algorithm, please check out here: https://github.com/Alteyae/lzquant-compression/blob/main/LZQUANT_ALGORITHM_PROCESS.md
