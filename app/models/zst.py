@@ -54,6 +54,10 @@ class ZstBatchCompressRequest(BaseModel):
         True, 
         description="Whether to include metadata in compressed files"
     )
+    base64_images: Optional[List[str]] = Field(
+        None,
+        description="List of Base64-encoded images to compress"
+    )
 
 
 class ZstBatchCompressResult(BaseModel):

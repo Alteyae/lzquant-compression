@@ -1,15 +1,16 @@
 """
-API v1 — PLZ format compression endpoints.
+API v1 - PLZ format compression endpoints.
 """
 import os
 import base64
 import asyncio
-import time
-import zipfile
-from typing import List
-
-from fastapi import APIRouter, File, UploadFile, HTTPException, Query
-from fastapi.responses import FileResponse, JSONResponse
+import io
+import httpx
+import aiohttp
+import logging
+from typing import List, Dict, Any
+from fastapi import APIRouter, File, UploadFile, HTTPException, Query, BackgroundTasks
+from fastapi.responses import FileResponse, JSONResponse, Response
 
 from app import TEMP_DIR
 from app.models.plz import (
@@ -17,281 +18,611 @@ from app.models.plz import (
     PLZDecompressionResponse,
     PLZBatchCompressRequest,
     PLZBatchDecompressRequest,
+    PLZBlobUrlCompressRequest
 )
 from app.core.plz import (
     PNGQUANT_DEFAULT_QUALITY,
     extract_plz_file,
-    read_plz_metadata,
-    compress_image_to_plz,
+    compress_image_to_plz
 )
-from app.utils.file_handling import get_temp_filepath
+from app.utils.file_handling import get_temp_filepath, schedule_cleanup
 from app.utils.metrics import get_cpu_mem
 
 router = APIRouter(prefix="/v1", tags=["PLZ Compression v1"])
 
+# Set up logger
+logger = logging.getLogger(__name__)
 
-def _plz_path(file_id: str) -> str:
-    return os.path.join(TEMP_DIR, f"{file_id}_final.plz")
-
-
-def _decomp_path(file_id: str) -> str:
-    return os.path.join(TEMP_DIR, f"{file_id}_decompressed.png")
-
-
-def _require_plz(file_id: str) -> str:
-    path = _plz_path(file_id)
-    if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="Compressed file not found")
-    return path
-
-
-# ── Single-file compression ───────────────────────────────────────────────────
 
 @router.post("/compress/image", response_model=PLZCompressionResponse)
 async def compress_image(
-    file: UploadFile = File(...),
-    quality: int = Query(
-        PNGQUANT_DEFAULT_QUALITY, ge=0, le=100,
-        description="PNGQuant quality (0–100)",
-    ),
+    file: UploadFile = File(...), 
+    quality: int = Query(PNGQUANT_DEFAULT_QUALITY, ge=0, le=100, description="PNG compression quality (0-99)")
 ):
-    """Compress a PNG/JPEG image with PNGQuant + LZ4 (PLZ format)."""
+    """
+    Compress a PNG image using PNGQuant and LZ4 in sequence.
+    
+    Returns compression statistics and metrics comparing the original and decompressed images.
+    Only PNG and JPEG files are supported - other formats will be converted to PNG.
+    """
     if not file.filename.lower().endswith((".png", ".jpg", ".jpeg")):
         raise HTTPException(status_code=400, detail="Only PNG and JPEG files are supported")
-
-    file_id = get_temp_filepath().rsplit(os.sep, 1)[-1]  # bare UUID
-    final_path = _plz_path(file_id)
+    
+    # Generate a unique ID and paths
+    file_id = str(os.path.basename(file.filename).split('.')[0]) + "_" + os.path.basename(get_temp_filepath())
+    final_path = get_temp_filepath(file_id, "_final.plz")
+    
+    # Read file content
     content = await file.read()
-
+    
+    # Add filename to metadata
+    metadata = {
+        "original_filename": file.filename,
+    }
+    
     try:
-        r = compress_image_to_plz(
-            content, final_path, quality,
-            metadata={"original_filename": file.filename},
-        )
+        # Compress the image
+        compression_result = compress_image_to_plz(content, final_path, quality, metadata)
+        
+        # Create response
         return PLZCompressionResponse(
             file_id=file_id,
-            original_size=r["original_size"],
-            pngquant_size=r["pngquant_size"],
-            final_size=r["final_size"],
-            compressed_size=r["final_size"],
-            pngquant_compression_ratio=r["pngquant_compression_ratio"],
-            lz4_compression_ratio=r["lz4_compression_ratio"],
-            total_compression_ratio=r["total_compression_ratio"],
-            compression_ratio=r["compression_ratio"],
-            space_savings_percent=r["space_savings_percent"],
-            compression_time=r["compression_time"],
-            decompression_time=r["decompression_time"],
-            cpu_usage=r["cpu_usage"],
-            memory_usage=r["memory_usage"],
-            psnr=r["psnr"],
-            ssim=r["ssim"],
+            original_size=compression_result["original_size"],
+            pngquant_size=compression_result["pngquant_size"],
+            final_size=compression_result["final_size"],
+            compressed_size=compression_result["final_size"],  # Use final_size as compressed_size
+            pngquant_compression_ratio=compression_result["pngquant_compression_ratio"],
+            lz4_compression_ratio=compression_result["lz4_compression_ratio"],
+            total_compression_ratio=compression_result["total_compression_ratio"],
+            compression_ratio=compression_result["compression_ratio"],
+            space_savings_percent=compression_result["space_savings_percent"],
+            compression_time=compression_result["compression_time"],
+            decompression_time=compression_result["decompression_time"],
+            cpu_usage=compression_result["cpu_usage"],
+            memory_usage=compression_result["memory_usage"],
+            psnr=compression_result["psnr"],
+            ssim=compression_result["ssim"]
         )
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Compression failed: {exc}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Compression failed: {str(e)}")
 
-
-# ── Decompression ─────────────────────────────────────────────────────────────
 
 @router.get("/decompress/{file_id}", response_class=FileResponse)
 async def decompress_image(file_id: str):
-    """Decompress a previously compressed PLZ file and return the PNG."""
-    plz_path = _require_plz(file_id)
-    output_path = _decomp_path(file_id)
-
+    """
+    Decompress a previously compressed image and return it as a file.
+    """
+    compressed_path = os.path.join(TEMP_DIR, f"{file_id}_final.plz")
+    output_path = os.path.join(TEMP_DIR, f"{file_id}_decompressed.png")
+    
+    if not os.path.exists(compressed_path):
+        raise HTTPException(status_code=404, detail="Compressed file not found")
+    
     try:
-        metadata = extract_plz_file(plz_path, output_path)
-        original_name = metadata.get("original_filename", "")
-        if original_name.lower().endswith((".jpg", ".jpeg", ".png")):
-            filename = f"decompressed_{os.path.splitext(original_name)[0]}.png"
-        else:
-            filename = f"decompressed_{file_id}.png"
-        return FileResponse(output_path, media_type="image/png", filename=filename)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Decompression failed: {exc}")
+        metadata = extract_plz_file(compressed_path, output_path)
+        
+        # Use original filename if available in metadata
+        filename = f"decompressed_{file_id}.png"
+        if metadata and "original_filename" in metadata:
+            original_name = metadata["original_filename"]
+            if original_name.lower().endswith((".jpg", ".jpeg", ".png")):
+                filename = f"decompressed_{os.path.splitext(original_name)[0]}.png"
+        
+        return FileResponse(
+            output_path, 
+            media_type="image/png", 
+            filename=filename
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Decompression failed: {str(e)}")
 
 
 @router.get("/decompress/{file_id}/info", response_model=PLZDecompressionResponse)
 async def decompress_image_info(file_id: str):
-    """Decompress and return stats (sizes, timing, resource usage)."""
-    plz_path = _require_plz(file_id)
-    output_path = _decomp_path(file_id)
-
+    """
+    Decompress a previously compressed image and return detailed information about the decompression.
+    """
+    compressed_path = os.path.join(TEMP_DIR, f"{file_id}_final.plz")
+    output_path = os.path.join(TEMP_DIR, f"{file_id}_decompressed.png")
+    
+    if not os.path.exists(compressed_path):
+        raise HTTPException(status_code=404, detail="Compressed file not found")
+    
     try:
-        t0 = time.monotonic()
-        extract_plz_file(plz_path, output_path)
-        decompression_time = time.monotonic() - t0
-
+        # Start timing
+        import time
+        start_time = time.time()
+        
+        # Decompress
+        metadata = extract_plz_file(compressed_path, output_path)
+        decompression_time = time.time() - start_time
+        
+        # File sizes
+        compressed_size = os.path.getsize(compressed_path)
+        decompressed_size = os.path.getsize(output_path)
+        
+        # System resource usage
         cpu_mem = get_cpu_mem()
+        
         return PLZDecompressionResponse(
             file_id=file_id,
-            compressed_size=os.path.getsize(plz_path),
-            decompressed_size=os.path.getsize(output_path),
+            compressed_size=compressed_size,
+            decompressed_size=decompressed_size,
             decompression_time=decompression_time,
             cpu_usage=cpu_mem["cpu_usage"],
-            memory_usage=cpu_mem["memory_usage"],
+            memory_usage=cpu_mem["memory_usage"]
         )
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Decompression failed: {exc}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Decompression failed: {str(e)}")
 
-
-# ── File info & download ──────────────────────────────────────────────────────
 
 @router.get("/info/{file_id}")
 async def get_compression_info(file_id: str):
-    """List sizes and metadata for all intermediate files for this job."""
-    candidates = {
+    """
+    Get information about a previously compressed file including paths to original, 
+    pngquant-compressed, and PLZ-compressed versions.
+    """
+    paths = {
         "original": os.path.join(TEMP_DIR, f"{file_id}_input.png"),
         "pngquant": os.path.join(TEMP_DIR, f"{file_id}_pngquant.png"),
-        "plz": _plz_path(file_id),
-        "decompressed": _decomp_path(file_id),
+        "plz": os.path.join(TEMP_DIR, f"{file_id}_final.plz"),
+        "decompressed": os.path.join(TEMP_DIR, f"{file_id}_decompressed.png")
     }
-    result = {}
-    for key, path in candidates.items():
+    
+    results = {}
+    for key, path in paths.items():
         if os.path.exists(path):
-            entry: dict = {"exists": True, "size": os.path.getsize(path)}
-            if key == "plz":
-                meta, _ = read_plz_metadata(path)
-                entry["metadata"] = meta
-            result[key] = entry
+            results[key] = {
+                "exists": True,
+                "size": os.path.getsize(path)
+            }
+            
+            # Extract metadata from PLZ file if it exists
+            if key == "plz" and os.path.exists(path):
+                try:
+                    import json
+                    import struct
+                    with open(path, 'rb') as f:
+                        f.read(4)  # Skip magic number
+                        header_size = struct.unpack('<I', f.read(4))[0]
+                        header_json = f.read(header_size)
+                        metadata = json.loads(header_json.decode('utf-8'))
+                        results[key]["metadata"] = metadata
+                except Exception:
+                    results[key]["metadata"] = {"error": "Failed to extract metadata"}
         else:
-            result[key] = {"exists": False}
-    return JSONResponse(content=result)
+            results[key] = {
+                "exists": False
+            }
+    
+    return JSONResponse(content=results)
 
 
 @router.get("/download/{file_id}.plz")
 async def download_plz_file(file_id: str):
-    """Download the compressed PLZ file."""
-    plz_path = _require_plz(file_id)
-
+    """
+    Download the compressed PLZ file.
+    """
+    plz_path = os.path.join(TEMP_DIR, f"{file_id}_final.plz")
+    
+    if not os.path.exists(plz_path):
+        raise HTTPException(status_code=404, detail="Compressed PLZ file not found")
+    
     try:
-        meta, _ = read_plz_metadata(plz_path)
-        base = os.path.splitext(meta.get("original_filename", file_id))[0]
+        # Extract metadata for original filename
+        import json
+        import struct
+        with open(plz_path, 'rb') as f:
+            f.read(4)  # Skip magic number
+            header_size = struct.unpack('<I', f.read(4))[0]
+            header_json = f.read(header_size)
+            metadata = json.loads(header_json.decode('utf-8'))
+        
+        # Use original filename if available
+        filename = f"{file_id}.plz"
+        if "original_filename" in metadata:
+            base_name = os.path.splitext(metadata["original_filename"])[0]
+            filename = f"{base_name}.plz"
+        
         return FileResponse(
             plz_path,
             media_type="application/octet-stream",
-            filename=f"{base}.plz",
+            filename=filename
         )
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Download failed: {exc}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to download PLZ file: {str(e)}")
 
-
-# ── Batch operations ──────────────────────────────────────────────────────────
 
 @router.post("/compress/batch/base64")
 async def batch_compress_base64(
     request: PLZBatchCompressRequest,
-    quality: int = Query(
-        PNGQUANT_DEFAULT_QUALITY, ge=0, le=100,
-        description="PNGQuant quality (0–100)",
-    ),
+    quality: int = Query(PNGQUANT_DEFAULT_QUALITY, ge=0, le=100, description="PNG compression quality (0-99)")
 ):
-    """Compress a list of base64-encoded images to PLZ."""
+    """
+    Compress multiple Base64 images into PLZ format.
+    Accepts JSON input with "base64_images": ["data:image/png;base64,...", "data:image/png;base64,..."]
+    """
     results = []
-    for b64 in request.base64_images:
-        file_id = get_temp_filepath().rsplit(os.sep, 1)[-1]
-        final_path = _plz_path(file_id)
+
+    for base64_str in request.base64_images:
+        file_id = os.path.basename(get_temp_filepath())
+        final_path = get_temp_filepath(file_id, "_final.plz")
+
         try:
-            image_bytes = base64.b64decode(b64.split(",")[-1])
-            r = compress_image_to_plz(
-                image_bytes, final_path, quality,
-                metadata={"source": "base64", "quality": quality},
-            )
-            results.append({"file_id": file_id, **r})
-        except Exception as exc:
-            results.append({"file_id": file_id, "status": "failed", "error": str(exc)})
+            # Decode base64 data
+            base64_data = base64_str.split(",")[-1]  # Remove 'data:image/png;base64,' if present
+            image_bytes = base64.b64decode(base64_data)
+            
+            # Compress the image
+            metadata = {"source": "base64", "quality": quality}
+            compression_result = compress_image_to_plz(image_bytes, final_path, quality, metadata)
+            
+            # Create a properly formatted result with all required fields
+            results.append({
+                "file_id": file_id,
+                "original_size": compression_result["original_size"],
+                "pngquant_size": compression_result["pngquant_size"],
+                "final_size": compression_result["final_size"],
+                "compressed_size": compression_result["final_size"],  # Use final_size as compressed_size
+                "pngquant_compression_ratio": compression_result["pngquant_compression_ratio"],
+                "lz4_compression_ratio": compression_result["lz4_compression_ratio"],
+                "total_compression_ratio": compression_result["total_compression_ratio"],
+                "compression_ratio": compression_result["compression_ratio"],
+                "space_savings_percent": compression_result["space_savings_percent"],
+                "compression_time": compression_result["compression_time"],
+                "decompression_time": compression_result["decompression_time"],
+                "cpu_usage": compression_result["cpu_usage"],
+                "memory_usage": compression_result["memory_usage"],
+                "psnr": compression_result["psnr"],
+                "ssim": compression_result["ssim"]
+            })
+            
+        except Exception as e:
+            results.append({
+                "file_id": file_id,
+                "status": "failed",
+                "error": str(e)
+            })
+
     return results
 
 
 @router.post("/decompress/batch")
 async def batch_decompress_plz(request: PLZBatchDecompressRequest):
-    """Decompress multiple PLZ files; returns info + base64 previews."""
+    """
+    Decompress multiple PLZ files and return information about each decompression.
+    The decompressed files can be downloaded individually.
+    """
     results = []
+
     for file_id in request.file_ids:
-        plz_path = _plz_path(file_id)
-        output_path = _decomp_path(file_id)
+        plz_path = os.path.join(TEMP_DIR, f"{file_id}_final.plz")
+        output_path = os.path.join(TEMP_DIR, f"{file_id}_decompressed.png")
 
         if not os.path.exists(plz_path):
-            results.append({"file_id": file_id, "status": "failed", "error": "File not found"})
+            results.append({
+                "file_id": file_id,
+                "status": "failed",
+                "error": "File not found"
+            })
             continue
 
         try:
-            t0 = time.monotonic()
+            import time
+            start_time = time.time()
             metadata = extract_plz_file(plz_path, output_path)
-            decompression_time = time.monotonic() - t0
-
+            decompression_time = time.time() - start_time
+            
+            compressed_size = os.path.getsize(plz_path)
+            decompressed_size = os.path.getsize(output_path)
+            
+            # System resource usage
             cpu_mem = get_cpu_mem()
+            
+            # Generate download URL
+            download_url = f"/v1/decompress/{file_id}"
+            
+            # Convert decompressed image to Base64
             with open(output_path, "rb") as img_file:
-                preview = base64.b64encode(img_file.read()).decode()
+                image_base64 = base64.b64encode(img_file.read()).decode('utf-8')
 
             results.append({
                 "file_id": file_id,
                 "status": "success",
-                "compressed_size": os.path.getsize(plz_path),
-                "decompressed_size": os.path.getsize(output_path),
-                "decompression_time": round(decompression_time, 4),
+                "compressed_size": compressed_size,
+                "decompressed_size": decompressed_size,
+                "decompression_time": decompression_time,
                 "cpu_usage": cpu_mem["cpu_usage"],
                 "memory_usage": cpu_mem["memory_usage"],
-                "download_url": f"/v1/decompress/{file_id}",
+                "download_url": download_url,
                 "metadata": metadata,
-                "image_preview": f"data:image/png;base64,{preview}",
+                "image_preview": f"data:image/png;base64,{image_base64}"  
             })
-        except Exception as exc:
-            results.append({"file_id": file_id, "status": "failed", "error": str(exc)})
+        except Exception as e:
+            results.append({
+                "file_id": file_id,
+                "status": "failed",
+                "error": str(e)
+            })
 
     return results
 
 
 @router.post("/decompress/batch/download")
 async def batch_download_decompressed(request: PLZBatchDecompressRequest):
-    """Download multiple decompressed PNGs as a single ZIP archive."""
-    zip_id = get_temp_filepath().rsplit(os.sep, 1)[-1]
-    zip_path = os.path.join(TEMP_DIR, f"{zip_id}_decompressed_files.zip")
-    files_added: List[str] = []
-
+    """
+    Download multiple decompressed files as a ZIP archive.
+    """
+    # Create a temporary zip file
+    import zipfile
+    zip_file_id = os.path.basename(get_temp_filepath())
+    zip_path = os.path.join(TEMP_DIR, f"{zip_file_id}_decompressed_files.zip")
+    
+    # Track which files were successfully added to the ZIP
+    files_added = []
+    
     try:
-        with zipfile.ZipFile(zip_path, "w") as zf:
+        with zipfile.ZipFile(zip_path, 'w') as zip_file:
             for file_id in request.file_ids:
-                plz_path = _plz_path(file_id)
-                output_path = _decomp_path(file_id)
-
-                if not os.path.exists(output_path):
-                    if not os.path.exists(plz_path):
+                decompressed_path = os.path.join(TEMP_DIR, f"{file_id}_decompressed.png")
+                plz_path = os.path.join(TEMP_DIR, f"{file_id}_final.plz")
+                
+                if not os.path.exists(decompressed_path):
+                    # If the file doesn't exist but the PLZ file does, try to decompress it
+                    if os.path.exists(plz_path):
+                        try:
+                            metadata = extract_plz_file(plz_path, decompressed_path)
+                        except Exception:
+                            continue
+                    else:
                         continue
-                    try:
-                        extract_plz_file(plz_path, output_path)
-                    except Exception:
-                        continue
-
-                # Derive a human-friendly filename
-                meta, _ = read_plz_metadata(plz_path) if os.path.exists(plz_path) else ({}, False)
-                original = meta.get("original_filename", "")
-                filename = (
-                    f"{os.path.splitext(original)[0]}.png"
-                    if original
-                    else f"{file_id}.png"
-                )
-                zf.write(output_path, arcname=filename)
+                
+                # Get filename from metadata if possible
+                filename = f"{file_id}.png"
+                try:
+                    import json
+                    import struct
+                    if os.path.exists(plz_path):
+                        with open(plz_path, 'rb') as f:
+                            f.read(4)  # Skip magic number
+                            header_size = struct.unpack('<I', f.read(4))[0]
+                            header_json = f.read(header_size)
+                            metadata = json.loads(header_json.decode('utf-8'))
+                            if "original_filename" in metadata:
+                                original_name = metadata["original_filename"]
+                                filename = f"{os.path.splitext(original_name)[0]}.png"
+                except Exception:
+                    pass
+                
+                # Add file to ZIP
+                zip_file.write(decompressed_path, arcname=filename)
                 files_added.append(file_id)
-
+        
         if not files_added:
             raise HTTPException(status_code=404, detail="No valid files found to download")
+        
+        return FileResponse(
+            zip_path,
+            media_type="application/zip",
+            filename="decompressed_images.zip"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create ZIP archive: {str(e)}")
+    finally:
+        # Clean up the ZIP file after it's been sent
+        if os.path.exists(zip_path):
+            # Schedule deletion (can't delete immediately as it's being served)
+            async def delete_file():
+                await asyncio.sleep(60)  # Wait 60 seconds before deleting
+                if os.path.exists(zip_path):
+                    os.remove(zip_path)
+            
+            asyncio.create_task(delete_file())
 
-        # Schedule ZIP cleanup after it's served
-        async def _delete_zip():
-            await asyncio.sleep(60)
-            if os.path.exists(zip_path):
-                os.remove(zip_path)
 
-        asyncio.create_task(_delete_zip())
-        return FileResponse(zip_path, media_type="application/zip", filename="decompressed_images.zip")
+async def fetch_blob_url(blob_url: str) -> bytes:
+    """
+    Fetch content from a blob URL.
+    
+    Args:
+        blob_url: URL to the blob
+        
+    Returns:
+        The binary content of the blob
+        
+    Raises:
+        HTTPException: If fetching fails
+    """
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(blob_url, timeout=30.0)
+            response.raise_for_status()
+            return response.content
+    except Exception as e:
+        logger.error(f"Failed to fetch blob URL {blob_url}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch blob URL: {str(e)}")
 
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to create ZIP: {exc}")
+
+@router.post("/compress/blob-urls")
+async def compress_blob_urls(
+    request: PLZBlobUrlCompressRequest,
+    quality: int = Query(PNGQUANT_DEFAULT_QUALITY, ge=0, le=100, description="PNG compression quality (0-99)")
+):
+    """
+    Compress images from blob URLs.
+    
+    Fetches each blob URL server-side (avoiding CORS issues) and compresses the image.
+    
+    Args:
+        request: JSON with "blob_urls" containing URLs to fetch and compress
+        quality: PNGQuant compression quality (0-100)
+        
+    Returns:
+        List of compression results with file_ids for later retrieval
+    """
+    results = []
+    
+    for i, blob_url in enumerate(request.blob_urls):
+        file_id = os.path.basename(get_temp_filepath())
+        final_path = get_temp_filepath(file_id, "_final.plz")
+        
+        try:
+            # Fetch the blob content
+            logger.info(f"Fetching blob URL: {blob_url}")
+            image_bytes = await fetch_blob_url(blob_url)
+            
+            if not image_bytes:
+                results.append({
+                    "file_id": file_id,
+                    "status": "failed",
+                    "error": "Empty blob data received"
+                })
+                continue
+                
+            # Compress the image
+            metadata = {
+                "source": "blob_url",
+                "quality": quality,
+                "original_url": blob_url
+            }
+            compression_result = compress_image_to_plz(image_bytes, final_path, quality, metadata)
+            
+            # Add the result
+            results.append({
+                "file_id": file_id,
+                "original_size": compression_result["original_size"],
+                "pngquant_size": compression_result["pngquant_size"],
+                "final_size": compression_result["final_size"],
+                "compressed_size": compression_result["final_size"],
+                "pngquant_compression_ratio": compression_result["pngquant_compression_ratio"],
+                "lz4_compression_ratio": compression_result["lz4_compression_ratio"],
+                "total_compression_ratio": compression_result["total_compression_ratio"],
+                "compression_ratio": compression_result["compression_ratio"],
+                "space_savings_percent": compression_result["space_savings_percent"],
+                "compression_time": compression_result["compression_time"],
+                "decompression_time": compression_result["decompression_time"],
+                "cpu_usage": compression_result["cpu_usage"],
+                "memory_usage": compression_result["memory_usage"],
+                "psnr": compression_result["psnr"],
+                "ssim": compression_result["ssim"]
+            })
+            
+        except Exception as e:
+            logger.error(f"Failed to compress blob URL {blob_url}: {str(e)}")
+            results.append({
+                "file_id": file_id,
+                "status": "failed",
+                "error": str(e)
+            })
+    
+    return results
+
+
+@router.post("/compress/blob-urls/zip")
+async def compress_blob_urls_zip(
+    request: PLZBlobUrlCompressRequest,
+    quality: int = Query(PNGQUANT_DEFAULT_QUALITY, ge=0, le=100, description="PNG compression quality (0-99)")
+):
+    """
+    Compress images from blob URLs and return as a ZIP file.
+    
+    Fetches each blob URL server-side (avoiding CORS issues), compresses the images,
+    and returns all compressed PLZ files in a ZIP archive.
+    
+    Args:
+        request: JSON with "blob_urls" containing URLs to fetch and compress
+        quality: PNGQuant compression quality (0-100)
+        
+    Returns:
+        ZIP file containing all compressed PLZ files
+    """
+    import zipfile
+    
+    # Create a unique ID for this batch
+    batch_id = os.path.basename(get_temp_filepath())
+    
+    # Create a ZIP file in memory
+    zip_buffer = io.BytesIO()
+    
+    # Track compression summary
+    summary = {
+        "total_original_size": 0,
+        "total_compressed_size": 0,
+        "successful_count": 0,
+        "failed_count": 0,
+        "compression_ratio": 0
+    }
+    
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+        for i, blob_url in enumerate(request.blob_urls):
+            file_id = f"{batch_id}_{i}"
+            final_path = get_temp_filepath(file_id, "_final.plz")
+            
+            try:
+                # Fetch the blob content
+                logger.info(f"Fetching blob URL: {blob_url}")
+                image_bytes = await fetch_blob_url(blob_url)
+                
+                if not image_bytes:
+                    logger.error(f"Empty blob data received for URL: {blob_url}")
+                    summary["failed_count"] += 1
+                    continue
+                    
+                # Create metadata
+                metadata = {
+                    "source": "blob_url",
+                    "quality": quality,
+                    "original_url": blob_url,
+                    "batch_id": batch_id,
+                    "index": i
+                }
+                
+                # Compress the image
+                compression_result = compress_image_to_plz(image_bytes, final_path, quality, metadata)
+                
+                # Update summary
+                summary["total_original_size"] += compression_result["original_size"]
+                summary["total_compressed_size"] += compression_result["final_size"]
+                summary["successful_count"] += 1
+                
+                # Read compressed file
+                with open(final_path, 'rb') as f:
+                    compressed_data = f.read()
+                
+                # Add to ZIP with a meaningful name
+                filename = f"image_{i}.plz"
+                zip_file.writestr(filename, compressed_data)
+                
+                # Schedule cleanup
+                schedule_cleanup(final_path)
+                
+            except Exception as e:
+                logger.error(f"Failed to compress blob URL {blob_url}: {str(e)}")
+                summary["failed_count"] += 1
+    
+    # Calculate overall compression ratio
+    if summary["total_compressed_size"] > 0 and summary["total_original_size"] > 0:
+        summary["compression_ratio"] = round(
+            summary["total_original_size"] / summary["total_compressed_size"], 2
+        )
+    
+    # Check if any files were processed
+    if summary["successful_count"] == 0:
+        raise HTTPException(
+            status_code=400, 
+            detail="No files could be compressed. Check if blob URLs are accessible."
+        )
+    
+    # Create a temporary file for the ZIP
+    zip_path = get_temp_filepath(batch_id, "_compressed_files.zip")
+    with open(zip_path, 'wb') as f:
+        f.write(zip_buffer.getvalue())
+    
+    # Schedule cleanup
+    schedule_cleanup(zip_path, 3600)  # 1 hour
+    
+    return FileResponse(
+        zip_path,
+        media_type="application/zip",
+        filename="compressed_images.zip"
+    )

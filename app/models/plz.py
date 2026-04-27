@@ -47,6 +47,17 @@ class PLZBatchCompressRequest(BaseModel):
         80, ge=0, le=100, 
         description="PNGQuant compression quality (0-100)"
     )
+    
+
+class PLZBlobUrlCompressRequest(BaseModel):
+    """Request model for compressing images from blob URLs"""
+    blob_urls: List[str] = Field(
+        ..., description="List of blob URLs to fetch and compress"
+    )
+    quality: int = Field(
+        80, ge=0, le=100, 
+        description="PNGQuant compression quality (0-100)"
+    )
 
 
 class PLZBatchDecompressRequest(BaseModel):

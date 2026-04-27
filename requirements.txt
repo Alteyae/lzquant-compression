@@ -11,7 +11,6 @@ zstandard>=0.20.0,<1.0.0
 
 # Metrics
 numpy>=1.24.0,<2.0.0
-scikit-image>=0.21.0,<1.0.0
 
 # System
 psutil>=5.9.0,<6.0.0
